@@ -9,5 +9,6 @@ dependencies = [
     "polars>=2.0.0",
     "pyarrow>=26.0.0",
     "scipy>=1.18.1",
+    "torch>=2.14.1",
     "tqdm>=4.70.1",
 ]
