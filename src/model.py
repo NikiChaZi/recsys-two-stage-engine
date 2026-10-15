@@ -3,17 +3,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class Tower(nn.Module):
-    """
-    Универсальная башня:
-    Embedding -> Linear -> BatchNorm -> ReLU -> Linear -> L2-нормализация
-    """
     def __init__(self, num_entities: int, embedding_dim: int = 64, hidden_dim: int = 128):
         super().__init__()
         self.embedding = nn.Embedding(num_entities, embedding_dim)
         
         self.projector = nn.Sequential(
             nn.Linear(embedding_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim),  # <-- LayerNorm вместо BatchNorm1d
             nn.ReLU(),
             nn.Linear(hidden_dim, embedding_dim),
         )
@@ -21,9 +17,7 @@ class Tower(nn.Module):
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         x = self.embedding(ids)
         x = self.projector(x)
-        # L2-нормализация: векторы проецируются на гиперсферу единичного радиуса
         return F.normalize(x, p=2, dim=1)
-
 
 class TwoTowerModel(nn.Module):
     def __init__(
