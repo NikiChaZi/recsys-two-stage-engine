@@ -1,0 +1,17 @@
+# Python & Virtualenv
+.venv/
+__pycache__/
+*.py[cod]
+
+# Данные и артефакты
+data/raw/
+data/processed/
+*.parquet
+*.dat
+*.zip
+*.bin
+*.onnx
+
+# Метрики и логи
+catboost_info/
+.ipynb_checkpoints/
