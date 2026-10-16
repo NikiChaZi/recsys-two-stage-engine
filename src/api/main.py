@@ -1,3 +1,5 @@
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 from prometheus_fastapi_instrumentator import Instrumentator
 import os
 import random
@@ -186,6 +188,13 @@ app = FastAPI(
     description="Two-Stage RecSys Engine with Redis Feature Store, MMR & Multi-Armed Bandits",
     version="1.3.0",
     lifespan=lifespan,
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 Instrumentator().instrument(app).expose(app)
 
