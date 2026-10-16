@@ -5,9 +5,10 @@ from typing import Optional
 
 import polars as pl
 import torch
+import torch.nn.functional as F
 from catboost import CatBoostClassifier, Pool
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient, models
 
 from src.models.two_tower import TwoTowerModel
@@ -17,15 +18,15 @@ os.environ["NO_PROXY"] = "localhost,127.0.0.1"
 os.environ["no_proxy"] = "localhost,127.0.0.1"
 
 
-# --- Схемы данных ответа (Pydantic) ---
+# --- Pydantic Схемы ---
 class MovieRecommendation(BaseModel):
     rank: int
     movie_id: int
     title: str
     year: Optional[int]
     genres: list[str]
-    confidence_score: float  # Скор от CatBoost
-    retrieval_score: float   # Скор от Two-Tower
+    confidence_score: float
+    retrieval_score: float
 
 
 class RecommendationResponse(BaseModel):
@@ -34,23 +35,84 @@ class RecommendationResponse(BaseModel):
     stage1_retrieval_ms: float
     stage2_ranking_ms: float
     candidates_retrieved: int
+    diversity_applied: float
     recommendations: list[MovieRecommendation]
 
 
-# --- Глобальное состояние сервиса в памяти ---
+class FeedbackRequest(BaseModel):
+    user_id: int
+    movie_id: int
+    rating: float = Field(ge=1.0, le=5.0, description="Оценка от 1.0 до 5.0")
+
+
+class FeedbackResponse(BaseModel):
+    status: str
+    message: str
+    session_likes_count: int
+
+
+# --- Глобальное состояние ---
 state = {}
+
+
+def genre_jaccard_similarity(genres_a: list[str], genres_b: list[str]) -> float:
+    """Сходство Жаккара по жанрам: |A ∩ B| / |A ∪ B|."""
+    set_a, set_b = set(genres_a), set(genres_b)
+    if not set_a or not set_b:
+        return 0.0
+    intersection = len(set_a & set_b)
+    union = len(set_a | set_b)
+    return intersection / union if union > 0 else 0.0
+
+
+def apply_mmr_diversity(candidate_rows: list[dict], top_k: int, lambda_div: float) -> list[dict]:
+    """
+    Maximal Marginal Relevance (MMR) алгоритм:
+    Балансирует между скором уверенности CatBoost и жанровым разнообразием.
+    """
+    if lambda_div <= 0.0 or len(candidate_rows) <= top_k:
+        return candidate_rows[:top_k]
+
+    selected = []
+    candidates = candidate_rows.copy()
+
+    # Первым берем безусловного лидера по CatBoost
+    first = max(candidates, key=lambda x: x["catboost_prob"])
+    selected.append(first)
+    candidates.remove(first)
+
+    # Жадный выбор остальных k-1 фильмов
+    while len(selected) < top_k and candidates:
+        best_item = None
+        best_score = -float("inf")
+
+        for cand in candidates:
+            rel = cand["catboost_prob"]
+            # Максимальное сходство кандидата с уже выбранными фильмами
+            max_sim = max(
+                genre_jaccard_similarity(cand["genres_list"], sel["genres_list"])
+                for sel in selected
+            )
+            # Формула MMR: (1 - lambda) * Relevance - lambda * MaxSimilarity
+            mmr_score = (1.0 - lambda_div) * rel - lambda_div * max_sim
+
+            if mmr_score > best_score:
+                best_score = mmr_score
+                best_item = cand
+
+        selected.append(best_item)
+        candidates.remove(best_item)
+
+    return selected
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Инициализация моделей и данных в оперативной памяти при старте сервера."""
     print("\n[STARTUP] Инициализация Two-Stage RecSys Engine...")
     t0 = time.perf_counter()
 
-    # 1. Qdrant Client
     state["qdrant"] = QdrantClient(url="http://127.0.0.1:6333", timeout=10)
 
-    # 2. Маппинги и Two-Tower
     mappings = torch.load("models/mappings.pt", weights_only=False)
     state["user2idx"] = mappings["user2idx"]
     state["movie2idx"] = mappings["movie2idx"]
@@ -60,51 +122,68 @@ async def lifespan(app: FastAPI):
     tt_model.eval()
     state["two_tower"] = tt_model
 
-    # 3. CatBoost Ranker
     ranker = CatBoostClassifier()
     ranker.load_model("models/ranker.cbm")
     state["ranker"] = ranker
 
-    # 4. In-Memory Feature Store (Polars -> быстрые словари)
     u_feat = pl.read_parquet("data/processed/user_features.parquet").with_columns(pl.col("user_id").cast(pl.Int32))
     m_feat = pl.read_parquet("data/processed/movie_features.parquet").with_columns(pl.col("movie_id").cast(pl.Int32))
 
     state["user_features"] = {row["user_id"]: row for row in u_feat.iter_rows(named=True)}
     state["movie_features"] = {row["movie_id"]: row for row in m_feat.iter_rows(named=True)}
 
-    # 5. История просмотров пользователей (для исключения дублей)
     train = pl.read_parquet("data/processed/train.parquet")
     train_hist = train.group_by("user_id").agg(pl.col("movie_id").alias("seen"))
     state["user_seen"] = {row["user_id"]: set(row["seen"]) for row in train_hist.iter_rows(named=True)}
 
-    # Самые популярные фильмы (Fallback на случай холодного старта)
-    popular_movies = (
-        train.group_by("movie_id")
-        .len()
-        .sort("len", descending=True)
-        .limit(20)["movie_id"]
-        .to_list()
-    )
-    state["popular_fallback"] = popular_movies
+    # Сессионный буфер недавних лайков (для динамического смещения вектора)
+    state["session_likes"] = {}
 
     startup_time = (time.perf_counter() - t0) * 1000
-    print(f"[STARTUP] Система полностью готова за {startup_time:.2f} мс!\n")
+    print(f"[STARTUP] Система готова за {startup_time:.2f} мс!\n")
     yield
     print("[SHUTDOWN] Остановка сервера...")
 
 
 app = FastAPI(
     title="Real-Time RecSys Platform API",
-    description="High-performance Two-Stage Recommendation Engine (Two-Tower + Qdrant + CatBoost)",
-    version="1.0.0",
+    description="High-performance Two-Stage Recommendation Engine (Two-Tower + Qdrant + CatBoost + MMR)",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
 
 @app.get("/health")
 def healthcheck():
-    """Проверка жизнеспособности сервиса."""
     return {"status": "ok", "qdrant_connected": True}
+
+
+@app.post("/feedback", response_model=FeedbackResponse)
+def submit_feedback(feedback: FeedbackRequest):
+    """
+    Эндпоинт отправки пользовательского действия (лайка):
+    1. Исключает фильм из будущей выдачи (чтобы не рекомендовать просмотренное).
+    2. При оценке >= 4.0 добавляет фильм в активную сессию для мгновенного смещения вкуса.
+    """
+    user_id = feedback.user_id
+    movie_id = feedback.movie_id
+
+    if user_id not in state["user_seen"]:
+        state["user_seen"][user_id] = set()
+
+    state["user_seen"][user_id].add(movie_id)
+
+    if user_id not in state["session_likes"]:
+        state["session_likes"][user_id] = []
+
+    if feedback.rating >= 4.0:
+        state["session_likes"][user_id].append(movie_id)
+
+    return FeedbackResponse(
+        status="success",
+        message=f"Фильм #{movie_id} учтен. Рекомендации для пользователя #{user_id} адаптированы в реальном времени.",
+        session_likes_count=len(state["session_likes"][user_id]),
+    )
 
 
 @app.get("/recommend/{user_id}", response_model=RecommendationResponse)
@@ -112,39 +191,50 @@ def get_recommendations(
     user_id: int,
     k: int = Query(default=10, ge=1, le=50, description="Количество рекомендаций"),
     genre: Optional[str] = Query(default=None, description="Опциональный фильтр по жанру"),
+    diversity: float = Query(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Параметр разнообразия MMR (0.0 — чистая релевантность, 0.5 — сбалансированное разнообразие)",
+    ),
 ):
-    """
-    Главный эндпоинт сквозного Two-Stage инференса:
-    1. Stage 1 (Two-Tower + Qdrant) -> отбор топ-100 кандидатов
-    2. Stage 2 (CatBoost) -> тонкое ранжирование сотни кандидатов
-    3. Выдача топ-K лучших фильмов
-    """
     total_start = time.perf_counter()
 
-    # Проверка на холодного пользователя
     user2idx = state["user2idx"]
+    movie2idx = state["movie2idx"]
     if user_id not in user2idx or user_id not in state["user_features"]:
-        raise HTTPException(
-            status_code=404,
-            detail=f"User #{user_id} не найден. Используйте ID от 1 до 6040 или эндпоинт холодного старта.",
-        )
+        raise HTTPException(status_code=404, detail=f"User #{user_id} не найден.")
 
-    # ==========================================
-    # СТАДИЯ 1: Candidate Retrieval (Qdrant)
-    # ==========================================
+    # ========================================================
+    # СТАДИЯ 1: ДИНАМИЧЕСКИЙ ВЕКТОР ЮЗЕРА + QDRANT RETRIEVAL
+    # ========================================================
     t1_start = time.perf_counter()
     uidx = torch.tensor([user2idx[user_id]])
+
     with torch.no_grad():
-        user_vector = state["two_tower"].user_tower(uidx).squeeze(0).tolist()
+        base_user_vec = state["two_tower"].user_tower(uidx)  # (1, 64)
+
+        # ДИНАМИЧЕСКОЕ СМЕЩЕНИЕ: если в сессии есть лайки — подмешиваем их векторы!
+        recent_likes = state["session_likes"].get(user_id, [])
+        if recent_likes:
+            recent_indices = [movie2idx[m] for m in recent_likes[-5:] if m in movie2idx]
+            if recent_indices:
+                items_tensor = torch.tensor(recent_indices)
+                recent_item_vecs = state["two_tower"].item_tower(items_tensor).mean(dim=0, keepdim=True)
+                # 65% базовый исторический вкус + 35% сиюминутные клики сессии
+                blended = 0.65 * base_user_vec + 0.35 * recent_item_vecs
+                user_vector = F.normalize(blended, p=2, dim=1).squeeze(0).tolist()
+            else:
+                user_vector = base_user_vec.squeeze(0).tolist()
+        else:
+            user_vector = base_user_vec.squeeze(0).tolist()
 
     seen_movies = list(state["user_seen"].get(user_id, set()))
-
     must_not = [models.HasIdCondition(has_id=seen_movies)] if seen_movies else None
     must = [models.FieldCondition(key="genres", match=models.MatchValue(value=genre))] if genre else None
 
     query_filter = models.Filter(must=must, must_not=must_not)
 
-    # Запрашиваем 100 кандидатов из Qdrant
     qdrant_results = state["qdrant"].query_points(
         collection_name="movies",
         query=user_vector,
@@ -155,11 +245,11 @@ def get_recommendations(
     t1_elapsed = (time.perf_counter() - t1_start) * 1000
 
     if not qdrant_results.points:
-        raise HTTPException(status_code=404, detail="Кандидаты по заданным фильтрам не найдены.")
+        raise HTTPException(status_code=404, detail="Кандидаты не найдены.")
 
-    # ==========================================
-    # СТАДИЯ 2: Heavy Ranking (CatBoost)
-    # ==========================================
+    # ========================================================
+    # СТАДИЯ 2: РАНЖИРОВАНИЕ ЧЕРЕЗ CATBOOST
+    # ========================================================
     t2_start = time.perf_counter()
     u_f = state["user_features"][user_id]
     m_feat_dict = state["movie_features"]
@@ -202,21 +292,26 @@ def get_recommendations(
     X_cand["gender"] = X_cand["gender"].fillna("Unknown")
     X_cand["genres"] = X_cand["genres"].fillna("Unknown")
 
-    # Быстрый инференс CatBoost по 100 кандидатам
     pool = Pool(X_cand, cat_features=["gender", "genres"])
     probs = state["ranker"].predict_proba(pool)[:, 1]
+
+    # Добавляем вероятность в список словарей
+    for idx, prob in enumerate(probs):
+        candidate_rows[idx]["catboost_prob"] = float(prob)
+
+    # Сортируем кандидатов по базовой уверенности CatBoost
+    candidate_rows.sort(key=lambda x: x["catboost_prob"], reverse=True)
+
+    # ========================================================
+    # СТАДИЯ 3: DIVERSITY / MMR ПОСТ-ПРОЦЕССИНГ
+    # ========================================================
+    final_candidates = apply_mmr_diversity(candidate_rows, top_k=k, lambda_div=diversity)
     t2_elapsed = (time.perf_counter() - t2_start) * 1000
 
-    cand_df = cand_df.with_columns(pl.Series("catboost_prob", probs))
-    top_k_df = cand_df.sort("catboost_prob", descending=True).head(k)
-
-    # ==========================================
-    # Формирование ответа
-    # ==========================================
     total_elapsed = (time.perf_counter() - total_start) * 1000
 
     recommendations = []
-    for rank_idx, row in enumerate(top_k_df.iter_rows(named=True), start=1):
+    for rank_idx, row in enumerate(final_candidates, start=1):
         recommendations.append(
             MovieRecommendation(
                 rank=rank_idx,
@@ -224,7 +319,7 @@ def get_recommendations(
                 title=row["title"],
                 year=row["year"],
                 genres=row["genres_list"],
-                confidence_score=round(float(row["catboost_prob"]), 4),
+                confidence_score=round(row["catboost_prob"], 4),
                 retrieval_score=round(float(row["two_tower_score"]), 4),
             )
         )
@@ -235,5 +330,6 @@ def get_recommendations(
         stage1_retrieval_ms=round(t1_elapsed, 2),
         stage2_ranking_ms=round(t2_elapsed, 2),
         candidates_retrieved=len(qdrant_results.points),
+        diversity_applied=diversity,
         recommendations=recommendations,
     )
