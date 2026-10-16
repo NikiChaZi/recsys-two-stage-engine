@@ -111,7 +111,8 @@ async def lifespan(app: FastAPI):
     print("\n[STARTUP] Инициализация Two-Stage RecSys Engine...")
     t0 = time.perf_counter()
 
-    state["qdrant"] = QdrantClient(url="http://127.0.0.1:6333", timeout=10)
+    qdrant_url = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
+    state["qdrant"] = QdrantClient(url=qdrant_url, timeout=10)
 
     mappings = torch.load("models/mappings.pt", weights_only=False)
     state["user2idx"] = mappings["user2idx"]

@@ -6,9 +6,28 @@ services:
     container_name: recsys_qdrant
     restart: always
     ports:
-      - "6333:6333" # HTTP API и Веб-дашборд
-      - "6334:6334" # gRPC API (для ультрабыстрого общения)
+      - "6333:6333"
+      - "6334:6334"
     volumes:
       - ./data/qdrant_storage:/qdrant/storage
     environment:
       - QDRANT__SERVICE__ENABLE_CORS=true
+    networks:
+      - recsys_net
+
+  api:
+    build: .
+    container_name: recsys_api
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+    depends_on:
+      - qdrant
+    networks:
+      - recsys_net
+
+networks:
+  recsys_net:
+    driver: bridge
