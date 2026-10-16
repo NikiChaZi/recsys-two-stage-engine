@@ -1,5 +1,5 @@
 import polars as pl
-from metrics import hit_rate_at_k, ndcg_at_k
+from src.evaluation.metrics import hit_rate_at_k, ndcg_at_k
 from tqdm import tqdm
 
 def run_popularity_baseline():

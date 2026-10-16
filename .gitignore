@@ -18,6 +18,5 @@ catboost_info/
 
 # Векторное хранилище
 data/qdrant_storage/
-"models/" 
 *.pt
 models/

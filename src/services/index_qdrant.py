@@ -11,7 +11,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from tqdm import tqdm
 
-from model import TwoTowerModel
+from src.models.two_tower import TwoTowerModel
 
 def parse_movies_metadata(raw_path: str = "data/raw/ml-1m/movies.dat") -> dict[int, dict]:
     """Парсит названия, год и жанры фильмов."""

@@ -22,7 +22,7 @@ class QdrantRetrievalService:
         self.movie2idx = mappings["movie2idx"]
 
         # 2. Загрузка весов обученной модели Two-Tower
-        from model import TwoTowerModel
+        from src.models.two_tower import TwoTowerModel
         self.model = TwoTowerModel(
             num_users=len(self.user2idx),
             num_movies=len(self.movie2idx),

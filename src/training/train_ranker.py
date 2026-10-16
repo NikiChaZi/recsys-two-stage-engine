@@ -4,7 +4,7 @@ import torch
 from pathlib import Path
 from catboost import CatBoostClassifier, Pool
 
-from model import TwoTowerModel
+from src.models.two_tower import TwoTowerModel
 
 def generate_training_data(sample_ratio: float = 0.5):
     print("1. Загрузка взаимодействий и признаков...")

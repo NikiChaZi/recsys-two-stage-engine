@@ -2,8 +2,8 @@ import torch
 from pathlib import Path
 from tqdm import tqdm
 
-from dataset import prepare_data_and_mappings
-from model import TwoTowerModel
+from src.data.dataset import prepare_data_and_mappings
+from src.models.two_tower import TwoTowerModel
 
 def train(
     epochs: int = 15,       # 15 эпох вместо 7

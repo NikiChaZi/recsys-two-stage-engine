@@ -1,8 +1,8 @@
 import polars as pl
 import torch
 from tqdm import tqdm
-from metrics import hit_rate_at_k, ndcg_at_k
-from model import TwoTowerModel
+from src.evaluation.metrics import hit_rate_at_k, ndcg_at_k
+from src.models.two_tower import TwoTowerModel
 
 def evaluate():
     # 1. Загрузка данных и маппингов

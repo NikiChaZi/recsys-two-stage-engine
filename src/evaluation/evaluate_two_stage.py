@@ -3,8 +3,8 @@ import torch
 from catboost import CatBoostClassifier, Pool
 from tqdm import tqdm
 
-from metrics import hit_rate_at_k, ndcg_at_k
-from model import TwoTowerModel
+from src.evaluation.metrics import hit_rate_at_k, ndcg_at_k
+from src.models.two_tower import TwoTowerModel
 
 
 def evaluate_full_pipeline():
