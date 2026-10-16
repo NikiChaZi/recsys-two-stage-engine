@@ -1,3 +1,4 @@
+from prometheus_fastapi_instrumentator import Instrumentator
 import os
 import random
 import time
@@ -186,7 +187,7 @@ app = FastAPI(
     version="1.3.0",
     lifespan=lifespan,
 )
-
+Instrumentator().instrument(app).expose(app)
 
 @app.get("/health")
 def healthcheck():

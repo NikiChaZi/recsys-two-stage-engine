@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   qdrant:
     image: qdrant/qdrant:latest
@@ -27,18 +25,27 @@ services:
     networks:
       - recsys_net
 
-  api:
-    build: .
-    container_name: recsys_api
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: recsys_prometheus
     restart: always
     ports:
-      - "8000:8000"
+      - "9090:9090"
+    volumes:
+      - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - recsys_net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: recsys_grafana
+    restart: always
+    ports:
+      - "3000:3000"
     environment:
-      - QDRANT_URL=http://qdrant:6333
-      - REDIS_URL=redis://redis:6379/0
-    depends_on:
-      - qdrant
-      - redis
+      - GF_SECURITY_ADMIN_PASSWORD=admin
     networks:
       - recsys_net
 

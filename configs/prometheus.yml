@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: "recsys_fastapi"
+    metrics_path: "/metrics"
+    static_configs:
+      # host.docker.internal позволяет контейнеру опрашивать твой локальный uvicorn на порту 8000
+      - targets: ["host.docker.internal:8000"]
