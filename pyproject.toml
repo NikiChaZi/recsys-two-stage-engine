@@ -8,6 +8,7 @@ dependencies = [
     "numpy>=2.5.4",
     "polars>=2.0.0",
     "pyarrow>=26.0.0",
+    "qdrant-client>=1.19.1",
     "scipy>=1.18.1",
     "torch>=2.14.1",
     "tqdm>=4.70.1",

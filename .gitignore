@@ -14,4 +14,7 @@ data/processed/
 
 # Метрики и логи
 catboost_info/
-.ipynb_checkpoints/
+.ipynb_checkpoints/*.pt
+
+# Векторное хранилище
+data/qdrant_storage/
