@@ -20,3 +20,5 @@ catboost_info/
 data/qdrant_storage/
 *.pt
 models/
+
+data/redis_storage/

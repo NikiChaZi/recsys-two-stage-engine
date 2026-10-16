@@ -15,6 +15,18 @@ services:
     networks:
       - recsys_net
 
+  redis:
+    image: redis:alpine
+    container_name: recsys_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./data/redis_storage:/data
+    command: redis-server --appendonly yes
+    networks:
+      - recsys_net
+
   api:
     build: .
     container_name: recsys_api
@@ -23,8 +35,10 @@ services:
       - "8000:8000"
     environment:
       - QDRANT_URL=http://qdrant:6333
+      - REDIS_URL=redis://redis:6379/0
     depends_on:
       - qdrant
+      - redis
     networks:
       - recsys_net
 

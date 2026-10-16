@@ -1,4 +1,5 @@
 import os
+import random
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -12,8 +13,8 @@ from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient, models
 
 from src.models.two_tower import TwoTowerModel
+from src.services.redis_store import RedisSessionStore
 
-# Отключаем системный прокси для Qdrant
 os.environ["NO_PROXY"] = "localhost,127.0.0.1"
 os.environ["no_proxy"] = "localhost,127.0.0.1"
 
@@ -27,6 +28,7 @@ class MovieRecommendation(BaseModel):
     genres: list[str]
     confidence_score: float
     retrieval_score: float
+    is_exploration: bool = False
 
 
 class RecommendationResponse(BaseModel):
@@ -36,27 +38,29 @@ class RecommendationResponse(BaseModel):
     stage2_ranking_ms: float
     candidates_retrieved: int
     diversity_applied: float
+    exploration_rate: float
+    exploration_items_count: int
+    session_source: str
     recommendations: list[MovieRecommendation]
 
 
 class FeedbackRequest(BaseModel):
     user_id: int
     movie_id: int
-    rating: float = Field(ge=1.0, le=5.0, description="Оценка от 1.0 до 5.0")
+    rating: float = Field(ge=1.0, le=5.0)
 
 
 class FeedbackResponse(BaseModel):
     status: str
     message: str
-    session_likes_count: int
+    event_stream: str
 
 
-# --- Глобальное состояние ---
 state = {}
 
 
+# --- Алгоритмы разнообразия и бандитов ---
 def genre_jaccard_similarity(genres_a: list[str], genres_b: list[str]) -> float:
-    """Сходство Жаккара по жанрам: |A ∩ B| / |A ∪ B|."""
     set_a, set_b = set(genres_a), set(genres_b)
     if not set_a or not set_b:
         return 0.0
@@ -66,34 +70,25 @@ def genre_jaccard_similarity(genres_a: list[str], genres_b: list[str]) -> float:
 
 
 def apply_mmr_diversity(candidate_rows: list[dict], top_k: int, lambda_div: float) -> list[dict]:
-    """
-    Maximal Marginal Relevance (MMR) алгоритм:
-    Балансирует между скором уверенности CatBoost и жанровым разнообразием.
-    """
     if lambda_div <= 0.0 or len(candidate_rows) <= top_k:
         return candidate_rows[:top_k]
 
     selected = []
     candidates = candidate_rows.copy()
-
-    # Первым берем безусловного лидера по CatBoost
     first = max(candidates, key=lambda x: x["catboost_prob"])
     selected.append(first)
     candidates.remove(first)
 
-    # Жадный выбор остальных k-1 фильмов
     while len(selected) < top_k and candidates:
         best_item = None
         best_score = -float("inf")
 
         for cand in candidates:
             rel = cand["catboost_prob"]
-            # Максимальное сходство кандидата с уже выбранными фильмами
             max_sim = max(
                 genre_jaccard_similarity(cand["genres_list"], sel["genres_list"])
                 for sel in selected
             )
-            # Формула MMR: (1 - lambda) * Relevance - lambda * MaxSimilarity
             mmr_score = (1.0 - lambda_div) * rel - lambda_div * max_sim
 
             if mmr_score > best_score:
@@ -106,13 +101,55 @@ def apply_mmr_diversity(candidate_rows: list[dict], top_k: int, lambda_div: floa
     return selected
 
 
+def apply_bandit_exploration(
+    candidate_rows: list[dict],
+    top_k: int,
+    exploration_rate: float = 0.1,
+) -> tuple[list[dict], int]:
+    """
+    Epsilon-Greedy Multi-Armed Bandit:
+    Подмешивает скрытые жемчужины с высоким потенциалом (Uncertainty Exploration).
+    """
+    if exploration_rate <= 0.0 or len(candidate_rows) <= top_k:
+        return candidate_rows[:top_k], 0
+
+    for cand in candidate_rows:
+        count = cand.get("movie_rating_count", 0)
+        tt_score = max(0.01, float(cand.get("two_tower_score", 0.5)))
+        cand["bandit_potential"] = tt_score / ((count + 1) ** 0.3)
+
+    num_explore = max(1, int(top_k * exploration_rate))
+    num_exploit = top_k - num_explore
+
+    exploit_items = candidate_rows[:num_exploit]
+    exploit_ids = {x["movie_id"] for x in exploit_items}
+
+    remaining = [x for x in candidate_rows[num_exploit:] if x["movie_id"] not in exploit_ids]
+    remaining.sort(key=lambda x: x["bandit_potential"], reverse=True)
+    explore_items = remaining[:num_explore]
+
+    for item in explore_items:
+        item["is_bandit_explore"] = True
+
+    combined = exploit_items.copy()
+    for exp_item in explore_items:
+        insert_pos = random.randint(min(3, len(combined)), len(combined))
+        combined.insert(insert_pos, exp_item)
+
+    return combined[:top_k], len(explore_items)
+
+
+# --- Жизненный цикл сервиса ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("\n[STARTUP] Инициализация Two-Stage RecSys Engine...")
+    print("\n[STARTUP] Инициализация Two-Stage RecSys Engine с Redis...")
     t0 = time.perf_counter()
 
     qdrant_url = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
     state["qdrant"] = QdrantClient(url=qdrant_url, timeout=10)
+
+    redis_url = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+    state["redis_store"] = RedisSessionStore(redis_url=redis_url)
 
     mappings = torch.load("models/mappings.pt", weights_only=False)
     state["user2idx"] = mappings["user2idx"]
@@ -137,9 +174,6 @@ async def lifespan(app: FastAPI):
     train_hist = train.group_by("user_id").agg(pl.col("movie_id").alias("seen"))
     state["user_seen"] = {row["user_id"]: set(row["seen"]) for row in train_hist.iter_rows(named=True)}
 
-    # Сессионный буфер недавних лайков (для динамического смещения вектора)
-    state["session_likes"] = {}
-
     startup_time = (time.perf_counter() - t0) * 1000
     print(f"[STARTUP] Система готова за {startup_time:.2f} мс!\n")
     yield
@@ -148,56 +182,46 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Real-Time RecSys Platform API",
-    description="High-performance Two-Stage Recommendation Engine (Two-Tower + Qdrant + CatBoost + MMR)",
-    version="1.1.0",
+    description="Two-Stage RecSys Engine with Redis Feature Store, MMR & Multi-Armed Bandits",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
 
 @app.get("/health")
 def healthcheck():
-    return {"status": "ok", "qdrant_connected": True}
+    redis_alive = state["redis_store"].ping()
+    return {"status": "ok", "qdrant_connected": True, "redis_connected": redis_alive}
 
 
 @app.post("/feedback", response_model=FeedbackResponse)
 def submit_feedback(feedback: FeedbackRequest):
-    """
-    Эндпоинт отправки пользовательского действия (лайка):
-    1. Исключает фильм из будущей выдачи (чтобы не рекомендовать просмотренное).
-    2. При оценке >= 4.0 добавляет фильм в активную сессию для мгновенного смещения вкуса.
-    """
     user_id = feedback.user_id
     movie_id = feedback.movie_id
 
     if user_id not in state["user_seen"]:
         state["user_seen"][user_id] = set()
-
     state["user_seen"][user_id].add(movie_id)
 
-    if user_id not in state["session_likes"]:
-        state["session_likes"][user_id] = []
+    state["redis_store"].publish_feedback_event(user_id=user_id, movie_id=movie_id, rating=feedback.rating)
 
     if feedback.rating >= 4.0:
-        state["session_likes"][user_id].append(movie_id)
+        state["redis_store"].add_session_like(user_id=user_id, movie_id=movie_id, ttl_seconds=3600)
 
     return FeedbackResponse(
         status="success",
-        message=f"Фильм #{movie_id} учтен. Рекомендации для пользователя #{user_id} адаптированы в реальном времени.",
-        session_likes_count=len(state["session_likes"][user_id]),
+        message=f"Лайк фильму #{movie_id} записан в Redis. Сессионный контекст User #{user_id} обновлен.",
+        event_stream="events:feedback",
     )
 
 
 @app.get("/recommend/{user_id}", response_model=RecommendationResponse)
 def get_recommendations(
     user_id: int,
-    k: int = Query(default=10, ge=1, le=50, description="Количество рекомендаций"),
-    genre: Optional[str] = Query(default=None, description="Опциональный фильтр по жанру"),
-    diversity: float = Query(
-        default=0.0,
-        ge=0.0,
-        le=1.0,
-        description="Параметр разнообразия MMR (0.0 — чистая релевантность, 0.5 — сбалансированное разнообразие)",
-    ),
+    k: int = Query(default=10, ge=1, le=50),
+    genre: Optional[str] = Query(default=None),
+    diversity: float = Query(default=0.0, ge=0.0, le=1.0),
+    exploration_rate: float = Query(default=0.1, ge=0.0, le=0.5, description="Доля разведки новинок (Бандит)"),
 ):
     total_start = time.perf_counter()
 
@@ -206,23 +230,19 @@ def get_recommendations(
     if user_id not in user2idx or user_id not in state["user_features"]:
         raise HTTPException(status_code=404, detail=f"User #{user_id} не найден.")
 
-    # ========================================================
-    # СТАДИЯ 1: ДИНАМИЧЕСКИЙ ВЕКТОР ЮЗЕРА + QDRANT RETRIEVAL
-    # ========================================================
+    # 1. Читаем живую сессию из Redis
     t1_start = time.perf_counter()
+    recent_likes = state["redis_store"].get_session_likes(user_id=user_id, limit=5)
+
     uidx = torch.tensor([user2idx[user_id]])
-
     with torch.no_grad():
-        base_user_vec = state["two_tower"].user_tower(uidx)  # (1, 64)
+        base_user_vec = state["two_tower"].user_tower(uidx)
 
-        # ДИНАМИЧЕСКОЕ СМЕЩЕНИЕ: если в сессии есть лайки — подмешиваем их векторы!
-        recent_likes = state["session_likes"].get(user_id, [])
         if recent_likes:
-            recent_indices = [movie2idx[m] for m in recent_likes[-5:] if m in movie2idx]
+            recent_indices = [movie2idx[m] for m in recent_likes if m in movie2idx]
             if recent_indices:
                 items_tensor = torch.tensor(recent_indices)
                 recent_item_vecs = state["two_tower"].item_tower(items_tensor).mean(dim=0, keepdim=True)
-                # 65% базовый исторический вкус + 35% сиюминутные клики сессии
                 blended = 0.65 * base_user_vec + 0.35 * recent_item_vecs
                 user_vector = F.normalize(blended, p=2, dim=1).squeeze(0).tolist()
             else:
@@ -248,9 +268,7 @@ def get_recommendations(
     if not qdrant_results.points:
         raise HTTPException(status_code=404, detail="Кандидаты не найдены.")
 
-    # ========================================================
-    # СТАДИЯ 2: РАНЖИРОВАНИЕ ЧЕРЕЗ CATBOOST
-    # ========================================================
+    # 2. Ранжирование через CatBoost
     t2_start = time.perf_counter()
     u_f = state["user_features"][user_id]
     m_feat_dict = state["movie_features"]
@@ -296,17 +314,18 @@ def get_recommendations(
     pool = Pool(X_cand, cat_features=["gender", "genres"])
     probs = state["ranker"].predict_proba(pool)[:, 1]
 
-    # Добавляем вероятность в список словарей
     for idx, prob in enumerate(probs):
         candidate_rows[idx]["catboost_prob"] = float(prob)
 
-    # Сортируем кандидатов по базовой уверенности CatBoost
     candidate_rows.sort(key=lambda x: x["catboost_prob"], reverse=True)
 
-    # ========================================================
-    # СТАДИЯ 3: DIVERSITY / MMR ПОСТ-ПРОЦЕССИНГ
-    # ========================================================
-    final_candidates = apply_mmr_diversity(candidate_rows, top_k=k, lambda_div=diversity)
+    # 3. Разнообразие MMR
+    diverse_candidates = apply_mmr_diversity(candidate_rows, top_k=k + 5, lambda_div=diversity)
+
+    # 4. Multi-Armed Bandit Exploration
+    final_candidates, explore_count = apply_bandit_exploration(
+        diverse_candidates, top_k=k, exploration_rate=exploration_rate
+    )
     t2_elapsed = (time.perf_counter() - t2_start) * 1000
 
     total_elapsed = (time.perf_counter() - total_start) * 1000
@@ -322,6 +341,7 @@ def get_recommendations(
                 genres=row["genres_list"],
                 confidence_score=round(row["catboost_prob"], 4),
                 retrieval_score=round(float(row["two_tower_score"]), 4),
+                is_exploration=row.get("is_bandit_explore", False),
             )
         )
 
@@ -332,5 +352,8 @@ def get_recommendations(
         stage2_ranking_ms=round(t2_elapsed, 2),
         candidates_retrieved=len(qdrant_results.points),
         diversity_applied=diversity,
+        exploration_rate=exploration_rate,
+        exploration_items_count=explore_count,
+        session_source="Redis Online Feature Store",
         recommendations=recommendations,
     )
