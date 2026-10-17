@@ -198,9 +198,11 @@ app.add_middleware(
 )
 Instrumentator().instrument(app).expose(app)
 
+from fastapi import Response, status
+
 @app.get("/health")
-def healthcheck():
-    """Честная проверка доступности обеих баз данных."""
+def healthcheck(response: Response):
+    """Честная проверка доступности обеих баз данных с корректным HTTP кодом."""
     try:
         state["qdrant"].get_collections()
         qdrant_alive = True
@@ -213,6 +215,9 @@ def healthcheck():
         redis_alive = False
 
     is_healthy = qdrant_alive and redis_alive
+    if not is_healthy:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
     return {
         "status": "ok" if is_healthy else "degraded",
         "qdrant_connected": qdrant_alive,

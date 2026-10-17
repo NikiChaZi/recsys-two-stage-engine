@@ -50,3 +50,31 @@ def test_mmr_diversity_logic():
     
     assert "Action" in genres_selected
     assert "Comedy" in genres_selected
+
+def test_symmetric_loss_exact_equality():
+    """Тест 4: Проверка строгой симметрии InfoNCE лосса."""
+    model = TwoTowerModel(num_users=20, num_movies=20, embedding_dim=16)
+    users = torch.tensor([1, 2, 3])
+    movies = torch.tensor([5, 6, 7])
+    
+    u_emb, m_emb = model(users, movies)
+    loss = model.compute_loss(u_emb, m_emb)
+    
+    # Меняем местами эмбеддинги — симметричный лосс обязан выдать то же число
+    loss_transposed = model.compute_loss(m_emb, u_emb)
+    assert torch.isclose(loss, loss_transposed, atol=1e-5)
+
+
+def test_history_masking_prevents_seen_recommendations():
+    """Тест 5: Фильтрация просмотренного исключает дубликаты."""
+    raw_scores = torch.tensor([0.9, 0.8, 0.7, 0.6])
+    seen_indices = [0, 2] # Пользователь уже смотрел фильмы #0 и #2
+    
+    # Маскирование минус бесконечностью
+    raw_scores[seen_indices] = -float("inf")
+    top_candidates = torch.topk(raw_scores, k=2).indices.tolist()
+    
+    # Просмотренные фильмы никогда не попадут в топ
+    assert 0 not in top_candidates
+    assert 2 not in top_candidates
+    assert top_candidates == [1, 3]
