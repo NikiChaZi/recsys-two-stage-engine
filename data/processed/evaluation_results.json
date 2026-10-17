@@ -1,0 +1,15 @@
+{
+  "popularity_baseline": {
+    "hit_rate_at_10": 0.2473,
+    "ndcg_at_10": 0.0396
+  },
+  "stage1_two_tower": {
+    "hit_rate_at_10": 0.2026,
+    "hit_rate_at_100": 0.7648,
+    "ndcg_at_10": 0.0309
+  },
+  "stage2_full_pipeline": {
+    "hit_rate_at_10": 0.4313,
+    "ndcg_at_10": 0.0806
+  }
+}
