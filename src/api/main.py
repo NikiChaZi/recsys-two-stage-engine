@@ -256,9 +256,10 @@ def get_recommendations(
 ):
     total_start = time.perf_counter()
 
-    user2idx = state["user2idx"]
-    movie2idx = state["movie2idx"]
-    if user_id not in user2idx or user_id not in state["user_features"]:
+    user2idx = state.get("user2idx", {})
+    movie2idx = state.get("movie2idx", {})
+    user_features = state.get("user_features", {})
+    if user_id not in user2idx or user_id not in user_features:
         raise HTTPException(status_code=404, detail=f"User #{user_id} не найден.")
 
     # 1. Читаем живую сессию из Redis
@@ -388,3 +389,31 @@ def get_recommendations(
         session_source="Redis Online Feature Store",
         recommendations=recommendations,
     )
+
+import httpx
+
+OMDB_API_KEY = "f7c004c"
+
+@app.get("/poster")
+async def get_poster(title: str, year: Optional[int] = None):
+    """Безопасный прокси для загрузки постеров (ключ спрятан на бэкенде)."""
+    clean_title = title.strip()
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            # 1. Попытка с годом
+            url = f"https://www.omdbapi.com/?apikey={OMDB_API_KEY}&t={clean_title}&y={year or ''}"
+            res = await client.get(url)
+            data = res.json()
+            if data.get("Poster") and data["Poster"] != "N/A" and "tom and jerry" not in data.get("Title", "").lower():
+                return {"poster_url": data["Poster"]}
+            
+            # 2. Попытка без года
+            url2 = f"https://www.omdbapi.com/?apikey={OMDB_API_KEY}&t={clean_title}"
+            res2 = await client.get(url2)
+            data2 = res2.json()
+            if data2.get("Poster") and data2["Poster"] != "N/A" and "tom and jerry" not in data2.get("Title", "").lower():
+                return {"poster_url": data2["Poster"]}
+    except Exception:
+        pass
+
+    return {"poster_url": None}

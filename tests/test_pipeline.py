@@ -78,3 +78,26 @@ def test_history_masking_prevents_seen_recommendations():
     assert 0 not in top_candidates
     assert 2 not in top_candidates
     assert top_candidates == [1, 3]
+
+from fastapi.testclient import TestClient
+from src.api.main import app
+
+client = TestClient(app)
+
+
+def test_api_healthcheck_contract():
+    """Тест 6: Проверка HTTP-контракта эндпоинта /health."""
+    with TestClient(app) as client:
+        response = client.get("/health")
+        assert response.status_code in [200, 503]
+        data = response.json()
+        assert "status" in data
+        assert "qdrant_connected" in data
+        assert "redis_connected" in data
+
+
+def test_recommend_endpoint_validation():
+    """Тест 7: Валидация входных параметров API."""
+    with TestClient(app) as client:
+        response = client.get("/recommend/9999999")
+        assert response.status_code == 404

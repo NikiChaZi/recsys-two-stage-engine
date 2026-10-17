@@ -16,7 +16,6 @@ def generate_training_data(sample_ratio: float = 0.5):
     user2idx = mappings["user2idx"]
     movie2idx = mappings["movie2idx"]
 
-    # Приводим ID к единому типу Int32 во всех таблицах
     train_pos = train_pos.with_columns(
         pl.col("user_id").cast(pl.Int32),
         pl.col("movie_id").cast(pl.Int32),
@@ -24,43 +23,61 @@ def generate_training_data(sample_ratio: float = 0.5):
     user_feat = user_feat.with_columns(pl.col("user_id").cast(pl.Int32))
     movie_feat = movie_feat.with_columns(pl.col("movie_id").cast(pl.Int32))
 
-    # Для быстрой скорости обучения возьмем репрезентативную подвыборку
+    # Собираем историю каждого юзера, чтобы НЕ сэмплировать позитивы как негативы
+    user_seen_sets = {
+        row["user_id"]: set(row["seen"]) 
+        for row in train_pos.group_by("user_id").agg(pl.col("movie_id").alias("seen")).iter_rows(named=True)
+    }
+
     train_pos = train_pos.sample(fraction=sample_ratio, seed=42)
-    users_sample = train_pos["user_id"].to_list()
     
-    # 2. Генерируем негативные примеры (y = 0)
-    print("2. Генерация негативных примеров...")
+    # 2. Честная генерация негативных примеров (без пересечений с позитивами юзера)
+    print("2. Честная генерация негативных примеров...")
     all_movies = movie_feat["movie_id"].to_list()
     rng = np.random.default_rng(42)
-    random_neg_movies = rng.choice(all_movies, size=len(train_pos))
+
+    neg_user_ids = []
+    neg_movie_ids = []
+    
+    for uid in train_pos["user_id"].to_list():
+        seen = user_seen_sets.get(uid, set())
+        # Выбираем случайный фильм, который юзер точно НЕ смотрел
+        while True:
+            candidate_neg = int(rng.choice(all_movies))
+            if candidate_neg not in seen:
+                break
+        neg_user_ids.append(uid)
+        neg_movie_ids.append(candidate_neg)
 
     pos_df = train_pos.select([
         pl.col("user_id"),
         pl.col("movie_id"),
+        pl.col("timestamp"),
         pl.lit(1, dtype=pl.Int32).alias("target"),
     ])
 
     neg_df = pl.DataFrame(
         {
-            "user_id": users_sample,
-            "movie_id": [int(m) for m in random_neg_movies],
-            "target": [0] * len(train_pos),
+            "user_id": neg_user_ids,
+            "movie_id": neg_movie_ids,
+            "timestamp": train_pos["timestamp"].to_list(),
+            "target": [0] * len(neg_user_ids),
         },
         schema={
             "user_id": pl.Int32,
             "movie_id": pl.Int32,
+            "timestamp": pl.Int64,
             "target": pl.Int32,
         },
     )
 
-    full_df = pl.concat([pos_df, neg_df]).sample(fraction=1.0, shuffle=True, seed=42)
+    # Объединяем и сортируем по времени для честного Temporal Split валидации
+    full_df = pl.concat([pos_df, neg_df]).sort("timestamp")
 
-    # 3. Джойним фичи юзера и фильма
     print("3. Объединение признаков (Feature Join)...")
     full_df = full_df.join(user_feat, on="user_id", how="left")
     full_df = full_df.join(movie_feat, on="movie_id", how="left")
 
-    # 4. Считаем скор Two-Tower модели для каждой пары
     print("4. Расчет Two-Tower скоров...")
     model = TwoTowerModel(num_users=len(user2idx), num_movies=len(movie2idx))
     model.load_state_dict(torch.load("models/two_tower.pt", weights_only=True))
