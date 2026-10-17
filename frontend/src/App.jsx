@@ -4,32 +4,43 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { 
   Film, Heart, Sliders, Zap, Clock, Database, 
   RefreshCw, Dice5, AlertCircle, X, Orbit,
-  Activity, BarChart3, Terminal
+  Activity, BarChart3, Terminal, ExternalLink
 } from 'lucide-react';
 import Galaxy3D from './components/Galaxy3D';
 
 const API_BASE = 'http://localhost:8000';
 
-// Разворачиваем артикли: "Godfather: Part II, The" -> "The Godfather: Part II"
+// Полная очистка названий от скобок MovieLens, артиклей и спецсимволов
 function normalizeTitle(rawTitle) {
   if (!rawTitle) return '';
-  let title = rawTitle.replace(/\s*\(\d{4}\)$/, '').trim();
+  
+  // 1. Удаляем ВСЕ круглые скобки: '(1996)', '(ID4)', '(a.k.a. ...)'
+  let title = rawTitle.replace(/\s*\([^)]*\)/g, '').trim();
+  
+  // 2. Разворачиваем завершающие артикли: "Godfather: Part II, The" -> "The Godfather: Part II"
   const match = title.match(/^(.*),\s*(The|A|An)$/i);
   if (match) {
     title = `${match[2]} ${match[1]}`;
   }
-  // Точное название оригинального фильма 1971 года (без Тома и Джерри)
+  
+  // 3. Точечный фикс для Вонки 1971 года
   if (title.toLowerCase().includes('willy wonka')) {
     return 'Willy Wonka & the Chocolate Factory';
   }
+  
   return title.replace(/[:]/g, '').trim();
 }
 
-// 2-уровневый загрузчик постеров: OMDb (IMDb) -> Wikipedia
+// Генерация прямой ссылки на поиск в Netflix
+function getNetflixUrl(rawTitle) {
+  const clean = normalizeTitle(rawTitle);
+  return `https://www.netflix.com/search?q=${encodeURIComponent(clean)}`;
+}
+
+// 3-уровневый загрузчик постеров: OMDb -> Wikipedia API -> Wikipedia REST Summary
 const fetchPosterUrl = async (movie) => {
   const cleanTitle = normalizeTitle(movie.title);
 
-  // ЖЕЛЕЗНЫЙ ФИКС ДЛЯ ВОНКИ 1971 ГОДА (Джин Уайлдер):
   if (cleanTitle.toLowerCase().includes('wonka')) {
     const geneWilderPoster = "https://upload.wikimedia.org/wikipedia/en/thumb/7/7f/WillyWonkaMoviePoster.jpg/500px-WillyWonkaMoviePoster.jpg";
     localStorage.setItem(`poster_${movie.movie_id}`, geneWilderPoster);
@@ -40,44 +51,55 @@ const fetchPosterUrl = async (movie) => {
   const cached = localStorage.getItem(cacheKey);
   if (cached && cached !== 'null') return cached;
 
-  // 1. Попытка через OMDb (официальный IMDb)
+  // 1. Попытка через OMDb с годом
   try {
     const omdbUrl = `https://www.omdbapi.com/?apikey=f7c004c&t=${encodeURIComponent(cleanTitle)}&y=${movie.year || ''}`;
-    const res = await axios.get(omdbUrl, { timeout: 3500 });
+    const res = await axios.get(omdbUrl, { timeout: 4000 });
     if (res.data?.Poster && res.data.Poster !== 'N/A' && !res.data.Title.toLowerCase().includes('tom and jerry')) {
       localStorage.setItem(cacheKey, res.data.Poster);
       return res.data.Poster;
     }
   } catch (e) {}
 
-  // 2. Попытка без указания года
+  // 2. Попытка через OMDb без года (спасает фильмы с плавающими датами премьер)
   try {
     const omdbUrl2 = `https://www.omdbapi.com/?apikey=f7c004c&t=${encodeURIComponent(cleanTitle)}`;
-    const res2 = await axios.get(omdbUrl2, { timeout: 3500 });
+    const res2 = await axios.get(omdbUrl2, { timeout: 4000 });
     if (res2.data?.Poster && res2.data.Poster !== 'N/A' && !res2.data.Title.toLowerCase().includes('tom and jerry')) {
       localStorage.setItem(cacheKey, res2.data.Poster);
       return res2.data.Poster;
     }
   } catch (e) {}
 
-  // 3. Запасной вариант: Wikipedia
+  // 3. Запасной вариант: Wikipedia Search (берем топ-5 страниц и сортируем по релевантности)
   try {
-    const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(cleanTitle + ' film')}&gsrlimit=1&prop=pageimages&pithumbsize=600&format=json&origin=*`;
-    const res = await axios.get(wikiUrl, { timeout: 3500 });
+    const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(cleanTitle + ' film')}&gsrlimit=5&prop=pageimages&pithumbsize=600&format=json&origin=*`;
+    const res = await axios.get(wikiUrl, { timeout: 4000 });
     const pages = res.data?.query?.pages;
     if (pages) {
-      const firstPage = Object.values(pages)[0];
-      const imgUrl = firstPage?.thumbnail?.source;
-      if (imgUrl && !imgUrl.toLowerCase().includes('tom_and_jerry')) {
-        localStorage.setItem(cacheKey, imgUrl);
-        return imgUrl;
+      const sortedPages = Object.values(pages).sort((a, b) => (a.index ?? 99) - (b.index ?? 99));
+      const targetPage = sortedPages.find(p => p.thumbnail?.source && !p.thumbnail.source.toLowerCase().includes('tom_and_jerry'));
+      if (targetPage?.thumbnail?.source) {
+        localStorage.setItem(cacheKey, targetPage.thumbnail.source);
+        return targetPage.thumbnail.source;
       }
+    }
+  } catch (e) {}
+
+  // 4. Дополнительный fallback: Wikipedia Summary REST API
+  try {
+    const summaryUrl = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(cleanTitle.replace(/\s+/g, '_'))}`;
+    const res = await axios.get(summaryUrl, { timeout: 3000 });
+    if (res.data?.thumbnail?.source) {
+      localStorage.setItem(cacheKey, res.data.thumbnail.source);
+      return res.data.thumbnail.source;
     }
   } catch (e) {}
 
   return null;
 };
 
+// Компонент постера: яркий, без сплошного затемнения
 function MoviePoster({ movie }) {
   const [posterUrl, setPosterUrl] = useState(null);
   const [loaded, setLoaded] = useState(false);
@@ -97,14 +119,22 @@ function MoviePoster({ movie }) {
           src={posterUrl}
           alt={normalizeTitle(movie.title)}
           onLoad={() => setLoaded(true)}
-          className={`w-full h-full object-cover object-center transition-all duration-700 ${
-            loaded ? 'opacity-65 group-hover:opacity-85 group-hover:scale-105' : 'opacity-0'
+          className={`w-full h-full object-cover object-center brightness-105 contrast-[1.05] transition-all duration-500 will-change-transform ${
+            loaded ? 'opacity-100 group-hover:scale-105' : 'opacity-0'
           }`}
         />
       ) : (
-        <div className="w-full h-full bg-gradient-to-t from-black via-zinc-900 to-zinc-950 opacity-80" />
+        <div className="w-full h-full flex flex-col items-center justify-center bg-zinc-900 text-zinc-600 font-mono text-xs">
+          <Film className="w-8 h-8 mb-2 opacity-40" />
+          <span>Постер недоступен</span>
+        </div>
       )}
-      <div className="absolute inset-0 bg-gradient-to-t from-[#09090c] via-[#09090c]/60 to-transparent" />
+
+      {/* Верхний мягкий градиент ТОЛЬКО для читаемости бейджей */}
+      <div className="absolute inset-x-0 top-0 h-20 bg-gradient-to-b from-black/70 via-black/20 to-transparent pointer-events-none" />
+
+      {/* Нижний градиент строго под блоком с текстом (сам постер сверху остается ярким) */}
+      <div className="absolute inset-x-0 bottom-0 h-48 bg-gradient-to-t from-[#08080a] via-[#08080a]/80 to-transparent pointer-events-none" />
     </div>
   );
 }
@@ -174,6 +204,12 @@ export default function App() {
     } catch (err) {
       addLog(`ERR: Не удалось записать событие в Redis`);
     }
+  };
+
+  // Клик по фильму: переход на Netflix
+  const handleMovieClick = (movie) => {
+    const netflixUrl = getNetflixUrl(movie.title);
+    window.open(netflixUrl, '_blank', 'noopener,noreferrer');
   };
 
   return (
@@ -355,7 +391,9 @@ export default function App() {
                 <h2 className="text-xl font-bold tracking-tight text-white flex items-center gap-2">
                   Рекомендательная выдача // Топ-10
                 </h2>
-                <p className="text-xs text-zinc-400 mt-0.5">Официальные постеры • Кликни на карточку для открытия инспектора</p>
+                <p className="text-xs text-zinc-400 mt-0.5">
+                  Кликни на фильм для открытия на Netflix ↗ • Кнопка [Инспектор] покажет ML-скоринг
+                </p>
               </div>
               <span className="text-xs font-mono px-2.5 py-1 rounded bg-zinc-900 border border-zinc-800 text-zinc-400">
                 Ранжирование: CatBoost YetiRank
@@ -365,55 +403,81 @@ export default function App() {
             <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-6">
               {data?.recommendations.map((movie) => {
                 const isLiked = likedMovies.has(movie.movie_id);
+                const cleanTitle = normalizeTitle(movie.title);
 
                 return (
                   <div
                     key={movie.movie_id}
-                    onClick={() => setSelectedMovie(movie)}
+                    onClick={() => handleMovieClick(movie)}
+                    title={`Смотреть "${cleanTitle}" на Netflix`}
                     className={`group relative rounded-xl overflow-hidden flex flex-col justify-between aspect-[2/3] p-4 cursor-pointer border transition-all duration-300 shadow-xl ${
                       movie.is_exploration 
                         ? 'border-rose-500/70 shadow-rose-950/40 hover:border-rose-400' 
-                        : 'border-zinc-800/80 hover:border-amber-500/60 hover:shadow-2xl'
+                        : 'border-zinc-800/80 hover:border-amber-500/80 hover:shadow-2xl'
                     }`}
                   >
                     <MoviePoster movie={movie} />
 
-                    <div className="flex justify-between items-start z-10">
-                      <span className="px-2 py-0.5 rounded bg-black/70 backdrop-blur-md text-zinc-300 text-[11px] font-mono font-bold border border-white/10">
-                        #{movie.rank}
-                      </span>
-                      {movie.is_exploration && (
-                        <span className="px-2 py-0.5 rounded bg-rose-500 text-white text-[9px] font-mono font-black uppercase tracking-wider flex items-center gap-1 shadow-md shadow-rose-500/30">
-                          <Dice5 className="w-2.5 h-2.5" />
-                          РАЗВЕДКА
+                    {/* Верхняя строка: Ранг, Разведка и кнопка вызова Инспектора ML */}
+                    <div className="flex justify-between items-start z-10 w-full gap-2">
+                      <div className="flex items-center gap-1.5">
+                        <span className="px-2 py-0.5 rounded bg-black/75 backdrop-blur-md text-zinc-200 text-[11px] font-mono font-bold border border-white/10">
+                          #{movie.rank}
                         </span>
-                      )}
+                        {movie.is_exploration && (
+                          <span className="px-2 py-0.5 rounded bg-rose-500 text-white text-[9px] font-mono font-black uppercase tracking-wider flex items-center gap-1 shadow-md shadow-rose-500/30">
+                            <Dice5 className="w-2.5 h-2.5" />
+                            РАЗВЕДКА
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Кнопка вызова инспектора (не триггерит переход на Netflix) */}
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSelectedMovie(movie);
+                        }}
+                        title="Открыть ML-инспектор"
+                        className="px-2 py-0.5 rounded bg-black/75 hover:bg-amber-500 hover:text-black text-zinc-300 text-[10px] font-mono font-bold border border-white/10 transition-colors flex items-center gap-1 backdrop-blur-md"
+                      >
+                        <BarChart3 className="w-3 h-3" />
+                        ML
+                      </button>
                     </div>
 
+                    {/* Название и информация */}
                     <div className="z-10 mt-auto mb-2">
-                      <span className="text-[10px] font-mono uppercase tracking-widest text-amber-400/90 block mb-0.5">
+                      <span className="text-[10px] font-mono uppercase tracking-widest text-amber-400 font-bold block mb-0.5">
                         {movie.genres[0]}
                       </span>
-                      {/* НОРМАЛИЗОВАННОЕ НАЗВАНИЕ */}
-                      <h3 className="font-bold text-white text-base leading-snug line-clamp-2 group-hover:text-amber-300 transition-colors drop-shadow-md">
-                        {normalizeTitle(movie.title)}
-                      </h3>
+
+                      <div className="flex items-start justify-between gap-1 group-hover:text-red-400 transition-colors">
+                        <h3 className="font-bold text-white text-base leading-snug line-clamp-2 drop-shadow-md">
+                          {cleanTitle}
+                        </h3>
+                        <ExternalLink className="w-4 h-4 flex-shrink-0 mt-0.5 opacity-60 group-hover:opacity-100 transition-opacity" />
+                      </div>
+
                       {movie.year && (
-                        <span className="text-xs font-mono text-zinc-400 mt-0.5 block">
+                        <span className="text-xs font-mono text-zinc-300 mt-0.5 block font-medium">
                           {movie.year} г.
                         </span>
                       )}
                     </div>
 
-                    <div className="pt-2.5 border-t border-white/10 flex items-center justify-between z-10 -mx-4 -mb-4 p-3 bg-black/60 backdrop-blur-md">
+                    {/* Нижняя панель с процентом совпадения и лайком */}
+                    <div className="pt-2.5 border-t border-white/10 flex items-center justify-between z-10 -mx-4 -mb-4 p-3 bg-black/70 backdrop-blur-md">
                       <div>
-                        <div className="text-[9px] uppercase font-mono text-zinc-400">MATCH</div>
+                        <div className="text-[9px] uppercase font-mono text-zinc-400 font-bold">MATCH</div>
                         <div className="text-sm font-mono font-black text-amber-400">
                           {Math.round(movie.confidence_score * 100)}%
                         </div>
                       </div>
 
                       <button
+                        type="button"
                         onClick={(e) => handleLike(e, movie)}
                         className={`p-2 rounded-lg border transition-all active:scale-80 ${
                           isLiked 
@@ -471,7 +535,6 @@ export default function App() {
                   </button>
                 </div>
 
-                {/* НОРМАЛИЗОВАННОЕ НАЗВАНИЕ В ИНСПЕКТОРЕ */}
                 <h2 className="text-2xl font-bold text-white mb-1 leading-tight">
                   {normalizeTitle(selectedMovie.title)}
                 </h2>
@@ -479,13 +542,22 @@ export default function App() {
                   Релиз: {selectedMovie.year || 'Н/Д'} г. • ID #{selectedMovie.movie_id}
                 </span>
 
-                <div className="flex flex-wrap gap-1.5 mb-8">
+                <div className="flex flex-wrap gap-1.5 mb-6">
                   {selectedMovie.genres.map(g => (
                     <span key={g} className="px-2.5 py-1 rounded bg-zinc-900 border border-zinc-800 text-zinc-300 text-xs font-mono">
                       {g}
                     </span>
                   ))}
                 </div>
+
+                {/* Прямая кнопка на Netflix из инспектора */}
+                <button
+                  onClick={() => handleMovieClick(selectedMovie)}
+                  className="w-full mb-6 py-2.5 px-4 bg-red-600 hover:bg-red-500 text-white font-mono text-xs uppercase font-bold rounded-xl flex items-center justify-center gap-2 transition-colors shadow-lg shadow-red-950/40"
+                >
+                  <ExternalLink className="w-4 h-4" />
+                  Смотреть на Netflix
+                </button>
 
                 <div className="space-y-4 bg-zinc-900/60 p-5 rounded-xl border border-zinc-800/80 mb-6 font-mono">
                   <h4 className="text-xs uppercase font-bold text-zinc-400 flex items-center gap-1.5">
