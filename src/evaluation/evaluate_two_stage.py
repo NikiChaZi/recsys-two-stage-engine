@@ -43,18 +43,18 @@ def evaluate_full_pipeline():
     with torch.no_grad():
         all_item_embeddings = stage1_model.item_tower(all_indices)
 
-    # История просмотров Train (маскирование)
+    # История просмотров: разделяем сырые movie_id и индексы!
     train_history = train.group_by("user_id").agg(pl.col("movie_id").alias("seen"))
-    user_seen_dict = {row["user_id"]: [movie2idx[m] for m in row["seen"] if m in movie2idx] for row in train_history.iter_rows(named=True)}
+    user_seen_raw_ids = {row["user_id"]: set(row["seen"]) for row in train_history.iter_rows(named=True)}
+    user_seen_idx = {row["user_id"]: [movie2idx[m] for m in row["seen"] if m in movie2idx] for row in train_history.iter_rows(named=True)}
 
-    # Глобальный бейзлайн популярности
+    # Глобальный бейзлайн популярности (топ-200, чтобы хватило после фильтрации просмотренного)
     popular_movies = (
-        train.group_by("movie_id").len().sort("len", descending=True).limit(100)["movie_id"].to_list()
+        train.group_by("movie_id").len().sort("len", descending=True).limit(200)["movie_id"].to_list()
     )
 
     test_user_items = test.group_by("user_id").agg(pl.col("movie_id").alias("items"))
 
-    # Метрики для ВСЕХ трех подходов считаются одновременно в одном прогоне!
     baseline_hr, baseline_ndcg = [], []
     stage1_hr, stage1_ndcg, stage1_hr100 = [], [], []
     stage2_hr, stage2_ndcg = [], []
@@ -73,22 +73,22 @@ def evaluate_full_pipeline():
         if uid not in user2idx or uid not in user_dict:
             continue
 
-        seen_set = set(row["items"])
-        seen_indices = user_seen_dict.get(uid, [])
+        raw_seen = user_seen_raw_ids.get(uid, set())
+        idx_seen = user_seen_idx.get(uid, [])
 
-        # 1. Бейзлайн популярности (с исключением просмотренного)
-        pop_unseen = [m for m in popular_movies if m not in user_seen_dict.get(uid, [])][:10]
+        # 1. ЧЕСТНЫЙ бейзлайн популярности (сравниваем movie_id с movie_id!)
+        pop_unseen = [m for m in popular_movies if m not in raw_seen][:10]
         baseline_hr.append(hit_rate_at_k(pop_unseen, actual_movies, k=10))
         baseline_ndcg.append(ndcg_at_k(pop_unseen, actual_movies, k=10))
 
-        # 2. Stage 1: Two-Tower
+        # 2. Stage 1: Two-Tower (маскируем по индексам матрицы)
         uidx = torch.tensor([user2idx[uid]])
         with torch.no_grad():
             u_emb = stage1_model.user_tower(uidx)
             scores = torch.matmul(u_emb, all_item_embeddings.T).squeeze(0)
 
-            if seen_indices:
-                scores[seen_indices] = -float("inf")
+            if idx_seen:
+                scores[idx_seen] = -float("inf")
 
             top100_idx = torch.topk(scores, k=100).indices.tolist()
             stage1_candidates = [idx2movie[idx] for idx in top100_idx]
@@ -98,7 +98,7 @@ def evaluate_full_pipeline():
         stage1_hr100.append(hit_rate_at_k(stage1_candidates, actual_movies, k=100))
         stage1_ndcg.append(ndcg_at_k(stage1_candidates[:10], actual_movies, k=10))
 
-        # 3. Stage 2: CatBoost Re-Ranker
+        # 3. Stage 2: CatBoost Re-Ranker (ОДИН РАЗ, БЕЗ ДУБЛЯ)
         u_f = user_dict[uid]
         candidate_rows = []
         for mid, tt_score in zip(stage1_candidates, tt_scores):
@@ -152,18 +152,17 @@ def evaluate_full_pipeline():
         }
     }
 
-    # Сохраняем артефакт воспроизводимости в JSON
     res_path = Path("data/processed/evaluation_results.json")
     with open(res_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
 
     print("\n" + "="*55)
-    print("ИТОГОВОЕ ЧЕСТНОЕ СРАВНЕНИЕ (ДИНАМИЧЕСКИЙ РАСЧЕТ):")
+    print("ИТОГОВОЕ ЧЕСТНОЕ СРАВНЕНИЕ (БЕЗ ДУБЛЕЙ И БЕЗ БАГОВ):")
     print("="*55)
     print(f"1. Baseline:   HitRate@10 = {results['popularity_baseline']['hit_rate_at_10']} | NDCG@10 = {results['popularity_baseline']['ndcg_at_10']}")
     print(f"2. Stage 1:    HitRate@10 = {results['stage1_two_tower']['hit_rate_at_10']} | HitRate@100 = {results['stage1_two_tower']['hit_rate_at_100']} | NDCG@10 = {results['stage1_two_tower']['ndcg_at_10']}")
     print(f"3. Two-Stage:  HitRate@10 = {results['stage2_full_pipeline']['hit_rate_at_10']} | NDCG@10 = {results['stage2_full_pipeline']['ndcg_at_10']}")
-    print(f"✓ Артефакт воспроизводимости сохранен в: {res_path}")
+    print(f"✓ Артефакт сохранен в: {res_path}")
     print("="*55 + "\n")
 
 
