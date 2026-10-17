@@ -38,15 +38,13 @@ class TwoTowerModel(nn.Module):
         return user_emb, item_emb
 
     def compute_loss(self, user_emb: torch.Tensor, item_emb: torch.Tensor) -> torch.Tensor:
-        batch_size = user_emb.size(0)
-        
-        # Матрица сходства (B, B)
         similarity = torch.matmul(user_emb, item_emb.T) / self.temperature
+        targets = torch.arange(user_emb.size(0), device=user_emb.device)
         
-        # Правильные ответы лежат на диагонали: юзер 0 -> фильм 0, юзер 1 -> фильм 1 и т.д.
-        targets = torch.arange(batch_size, device=user_emb.device)
-        
-        return F.cross_entropy(similarity, targets)
+        # Симметричный контрастивный лосс (User-to-Item + Item-to-User)
+        loss_u2i = F.cross_entropy(similarity, targets)
+        loss_i2u = F.cross_entropy(similarity.T, targets)
+        return (loss_u2i + loss_i2u) / 2.0
 
 
 if __name__ == "__main__":

@@ -200,8 +200,24 @@ Instrumentator().instrument(app).expose(app)
 
 @app.get("/health")
 def healthcheck():
-    redis_alive = state["redis_store"].ping()
-    return {"status": "ok", "qdrant_connected": True, "redis_connected": redis_alive}
+    """Честная проверка доступности обеих баз данных."""
+    try:
+        state["qdrant"].get_collections()
+        qdrant_alive = True
+    except Exception:
+        qdrant_alive = False
+
+    try:
+        redis_alive = state["redis_store"].ping()
+    except Exception:
+        redis_alive = False
+
+    is_healthy = qdrant_alive and redis_alive
+    return {
+        "status": "ok" if is_healthy else "degraded",
+        "qdrant_connected": qdrant_alive,
+        "redis_connected": redis_alive,
+    }
 
 
 @app.post("/feedback", response_model=FeedbackResponse)
