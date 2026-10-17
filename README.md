@@ -72,11 +72,17 @@
 
 ### 1. Stage 1: Двухбашенная нейросеть (Two-Tower DSSM)
 Пользователи и фильмы проецируются на единичную 64-мерную гиперсферу:
-$$\mathbf{u} = \text{Tower}_{\text{user}}(\text{uid}), \quad \mathbf{v} = \text{Tower}_{\text{item}}(\text{mid}), \quad \|\mathbf{u}\|_2 = 1, \ \|\mathbf{v}\|_2 = 1$$
 
-* **Архитектура**: `Embedding(dim=64)` $\rightarrow$ `Linear(64, 128)` $\rightarrow$ `LayerNorm(128)` $\rightarrow$ `ReLU` $\rightarrow$ `Linear(128, 64)` $\rightarrow$ `$L_2$ Normalization`.
+$$
+\mathbf{u} = \text{Tower}_{\text{user}}(\text{uid}), \quad \mathbf{v} = \text{Tower}_{\text{item}}(\text{mid}), \quad \|\mathbf{u}\|_2 = 1, \quad \|\mathbf{v}\|_2 = 1
+$$
+
+* **Архитектура**: `Embedding(64)` $\rightarrow$ `Linear(64, 128)` $\rightarrow$ `LayerNorm(128)` $\rightarrow$ `ReLU` $\rightarrow$ `Linear(128, 64)` $\rightarrow$ $L_2$ Normalization.
 * **Функция потерь (Symmetric InfoNCE Loss с In-Batch Negatives)**:
-  $$\mathcal{L} = \frac{1}{2} \left( \mathcal{L}_{\text{user}\to\text{item}} + \mathcal{L}_{\text{item}\to\text{user}} \right), \quad \tau = 0.07$$
+
+$$
+\mathcal{L} = \frac{1}{2} \left( \mathcal{L}_{\text{user}\to\text{item}} + \mathcal{L}_{\text{item}\to\text{user}} \right), \quad \tau = 0.07
+$$
 
 ### 2. Stage 2: Градиентный бустинг (Pointwise CatBoost Ranker)
 Сотня отобранных кандидатов ранжируется ансамблем решающих деревьев CatBoost по 12 признакам:
@@ -86,9 +92,16 @@ $$\mathbf{u} = \text{Tower}_{\text{user}}(\text{uid}), \quad \mathbf{v} = \text{
 
 ### 3. Бизнес-логика: MMR Diversity & Multi-Armed Bandit
 * **Maximal Marginal Relevance (MMR)**: штрафует схожесть жанров по метрике Жаккара для предотвращения информационного пузыря:
-  $$\text{MMR} = \arg\max_{c \in C \setminus S} \left[ (1 - \lambda) \cdot P_{\text{CatBoost}}(c) - \lambda \cdot \max_{s \in S} \text{Jaccard}(G_c, G_s) \right]$$
+
+$$
+\text{MMR} = \arg\max_{c \in C \setminus S} \left[ (1 - \lambda) \cdot P_{\text{CatBoost}}(c) - \lambda \cdot \max_{s \in S} \text{Jaccard}(G_c, G_s) \right]
+$$
+
 * **$\epsilon$-Greedy Bandit (Uncertainty Exploration)**: подмешивает фильмы с высоким нейросетевым потенциалом, но малым числом оценок:
-  $$\text{ExplorationScore}(i) = \frac{\text{TwoTowerScore}(i)}{(\text{RatingCount}_i + 1)^{0.3}}$$
+
+$$
+\text{ExplorationScore}(i) = \frac{\text{TwoTowerScore}(i)}{(\text{RatingCount}_i + 1)^{0.3}}
+$$
 
 ---
 
