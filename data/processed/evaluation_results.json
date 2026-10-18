@@ -9,7 +9,7 @@
     "ndcg_at_10": 0.0309
   },
   "stage2_full_pipeline": {
-    "hit_rate_at_10": 0.4313,
-    "ndcg_at_10": 0.0806
+    "hit_rate_at_10": 0.4323,
+    "ndcg_at_10": 0.0818
   }
 }
