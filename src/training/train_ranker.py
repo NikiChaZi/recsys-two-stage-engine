@@ -23,6 +23,15 @@ def generate_training_data(sample_ratio: float = 0.5):
     user_feat = user_feat.with_columns(pl.col("user_id").cast(pl.Int32))
     movie_feat = movie_feat.with_columns(pl.col("movie_id").cast(pl.Int32))
 
+    # Несогласованные артефакты нельзя скорить чужим эмбеддингом с индексом 0.
+    for column, mapping in (("user_id", user2idx), ("movie_id", movie2idx)):
+        missing = set(train_pos[column].to_list()) - mapping.keys()
+        if missing:
+            raise ValueError(
+                f"Training {column} IDs missing from Two-Tower mappings: "
+                f"{sorted(missing)[:10]} (total: {len(missing)})"
+            )
+
     # Собираем историю каждого юзера, чтобы НЕ сэмплировать позитивы как негативы
     user_seen_sets = {
         row["user_id"]: set(row["seen"]) 
@@ -33,21 +42,26 @@ def generate_training_data(sample_ratio: float = 0.5):
     
     # 2. Честная генерация негативных примеров (без пересечений с позитивами юзера)
     print("2. Честная генерация негативных примеров...")
-    all_movies = movie_feat["movie_id"].to_list()
+    all_movies = sorted(set(movie_feat["movie_id"].to_list()) & movie2idx.keys())
     rng = np.random.default_rng(42)
 
     neg_user_ids = []
     neg_movie_ids = []
     
-    for uid in train_pos["user_id"].to_list():
-        seen = user_seen_sets.get(uid, set())
-        # Выбираем случайный фильм, который юзер точно НЕ смотрел
-        while True:
-            candidate_neg = int(rng.choice(all_movies))
-            if candidate_neg not in seen:
-                break
-        neg_user_ids.append(uid)
-        neg_movie_ids.append(candidate_neg)
+    neg_timestamps = []
+    for user_rows in train_pos.partition_by("user_id", maintain_order=True):
+        uid = user_rows["user_id"][0]
+        seen = user_seen_sets[uid]
+        # История взята до сэмплирования позитивов; выборка с возвращением.
+        candidates = [mid for mid in all_movies if mid not in seen]
+        if not candidates:
+            raise ValueError(
+                f"No eligible unseen negative movies for user_id={uid}: "
+                f"feature catalog / movie2idx intersection has {len(all_movies)} movies"
+            )
+        neg_user_ids.extend([uid] * len(user_rows))
+        neg_movie_ids.extend(rng.choice(candidates, size=len(user_rows)).tolist())
+        neg_timestamps.extend(user_rows["timestamp"].to_list())
 
     pos_df = train_pos.select([
         pl.col("user_id"),
@@ -60,7 +74,7 @@ def generate_training_data(sample_ratio: float = 0.5):
         {
             "user_id": neg_user_ids,
             "movie_id": neg_movie_ids,
-            "timestamp": train_pos["timestamp"].to_list(),
+            "timestamp": neg_timestamps,
             "target": [0] * len(neg_user_ids),
         },
         schema={
@@ -83,8 +97,8 @@ def generate_training_data(sample_ratio: float = 0.5):
     model.load_state_dict(torch.load("models/two_tower.pt", weights_only=True))
     model.eval()
 
-    u_indices = [user2idx.get(uid, 0) for uid in full_df["user_id"].to_list()]
-    m_indices = [movie2idx.get(mid, 0) for mid in full_df["movie_id"].to_list()]
+    u_indices = [user2idx[uid] for uid in full_df["user_id"].to_list()]
+    m_indices = [movie2idx[mid] for mid in full_df["movie_id"].to_list()]
 
     with torch.no_grad():
         u_emb = model.user_tower(torch.tensor(u_indices))
@@ -99,7 +113,7 @@ def generate_training_data(sample_ratio: float = 0.5):
     return full_df
 
 
-def train_catboost_ranker():
+def train_catboost_ranker(task_type: str = "CPU"):
     df = generate_training_data(sample_ratio=0.5)
 
     feature_cols = [
@@ -136,7 +150,7 @@ def train_catboost_ranker():
     train_pool = Pool(X_train, y_train, cat_features=cat_features)
     val_pool = Pool(X_val, y_val, cat_features=cat_features)
 
-    print("5. Обучаем CatBoost...")
+    print(f"5. Обучаем CatBoost (task_type={task_type})...")
     model = CatBoostClassifier(
         iterations=400,
         learning_rate=0.08,
@@ -144,7 +158,7 @@ def train_catboost_ranker():
         loss_function="Logloss",
         eval_metric="AUC",
         random_seed=42,
-        task_type="CPU",
+        task_type=task_type,
         verbose=50,
     )
 
@@ -168,4 +182,9 @@ def train_catboost_ranker():
 
 
 if __name__ == "__main__":
-    train_catboost_ranker()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Train the CatBoost ranker")
+    parser.add_argument("--task-type", choices=["CPU", "GPU"], default="CPU")
+    args = parser.parse_args()
+    train_catboost_ranker(task_type=args.task_type)

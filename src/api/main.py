@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from catboost import CatBoostClassifier, Pool
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
+from redis.exceptions import RedisError
 from qdrant_client import QdrantClient, models
 
 from src.models.two_tower import TwoTowerModel
@@ -230,18 +231,25 @@ def submit_feedback(feedback: FeedbackRequest):
     user_id = feedback.user_id
     movie_id = feedback.movie_id
 
-    if user_id not in state["user_seen"]:
-        state["user_seen"][user_id] = set()
-    state["user_seen"][user_id].add(movie_id)
+    try:
+        state["redis_store"].record_feedback(
+            user_id=user_id, movie_id=movie_id, rating=feedback.rating, ttl_seconds=3600
+        )
+    except RedisError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Не удалось подтвердить запись оценки в Redis. Попробуйте позже.",
+        ) from exc
 
-    state["redis_store"].publish_feedback_event(user_id=user_id, movie_id=movie_id, rating=feedback.rating)
-
+    # Локально исключаем фильм только после подтверждения записи Redis.
+    state["user_seen"].setdefault(user_id, set()).add(movie_id)
+    message = f"Оценка фильма #{movie_id} записана в Redis."
     if feedback.rating >= 4.0:
-        state["redis_store"].add_session_like(user_id=user_id, movie_id=movie_id, ttl_seconds=3600)
+        message += f" Сессионный контекст User #{user_id} обновлен."
 
     return FeedbackResponse(
         status="success",
-        message=f"Лайк фильму #{movie_id} записан в Redis. Сессионный контекст User #{user_id} обновлен.",
+        message=message,
         event_stream="events:feedback",
     )
 

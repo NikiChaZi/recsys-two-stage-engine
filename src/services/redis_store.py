@@ -23,6 +23,28 @@ class RedisSessionStore:
         pipe.expire(key, ttl_seconds)
         pipe.execute()
 
+    def record_feedback(self, user_id: int, movie_id: int, rating: float, ttl_seconds: int = 3600):
+        """Записывает событие и положительный лайк одной MULTI/EXEC-транзакцией.
+
+        Redis не откатывает ошибки отдельных команд во время EXEC. Потеря
+        ответа EXEC также не означает, что запись не состоялась; повтор запроса
+        может создать дубликат. Метод не гарантирует exactly-once доставку.
+        """
+        event = {
+            "user_id": str(user_id),
+            "movie_id": str(movie_id),
+            "rating": str(rating),
+            "timestamp": str(int(time.time())),
+        }
+        with self.r.pipeline(transaction=True) as pipe:
+            pipe.xadd("events:feedback", event, maxlen=50000)
+            if rating >= 4.0:
+                key = f"session:{user_id}"
+                pipe.lpush(key, movie_id)
+                pipe.ltrim(key, 0, 9)
+                pipe.expire(key, ttl_seconds)
+            pipe.execute()
+
     def get_session_likes(self, user_id: int, limit: int = 5) -> list[int]:
         """Возвращает последние N лайков текущей сессии за доли миллисекунды."""
         key = f"session:{user_id}"
